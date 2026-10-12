@@ -34,6 +34,8 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define BME_ADDR (0x76 << 1)
+#define ALARM_DELTA  300   /* 1.00 C sapmada alarm */
+#define ALARM_OFF    100
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -43,6 +45,8 @@
 
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
+
+TIM_HandleTypeDef htim2;
 
 UART_HandleTypeDef huart2;
 
@@ -56,6 +60,8 @@ static int8_t   dig_H6;
 static int32_t  t_fine;
 uint8_t chip_id = 0;
 char msg[96];
+int32_t base_temp = 0;
+uint8_t alarm_on = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -63,6 +69,7 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_USART2_UART_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -146,6 +153,21 @@ static uint32_t comp_hum(int32_t adc_H)
   if (v > 419430400) v = 419430400;
   return (uint32_t)(v >> 12);
 }
+
+static int bme_measure(int32_t *t, uint32_t *p, uint32_t *h)
+{
+  uint8_t d[8];
+  if (bme_read(0xF7, d, 8) != HAL_OK) return 0;
+
+  int32_t adc_P = ((int32_t)d[0] << 12) | ((int32_t)d[1] << 4) | (d[2] >> 4);
+  int32_t adc_T = ((int32_t)d[3] << 12) | ((int32_t)d[4] << 4) | (d[5] >> 4);
+  int32_t adc_H = ((int32_t)d[6] << 8) | d[7];
+
+  *t = comp_temp(adc_T);            /* once sicaklik: t_fine buradan gelir */
+  *p = comp_press(adc_P) / 256;
+  *h = comp_hum(adc_H) / 1024;
+  return 1;
+}
 /* USER CODE END 0 */
 
 /**
@@ -179,6 +201,7 @@ int main(void)
   MX_GPIO_Init();
   MX_I2C1_Init();
   MX_USART2_UART_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
   if (bme_read(0xD0, &chip_id, 1) != HAL_OK || (chip_id != 0x60 && chip_id != 0x58))
   {
@@ -186,13 +209,34 @@ int main(void)
     HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
     while (1);
   }
-  snprintf(msg, sizeof(msg), "Sensor ID: 0x%02X (%s)\r\n", chip_id, chip_id == 0x60 ? "BME280" : "BMP280");
-  HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
 
   bme_read_calibration();
-  if (chip_id == 0x60) bme_write(0xF2, 0x01);  /* nem x1, ctrl_meas'ten once yazilmali */
-  bme_write(0xF5, 0xA0);                       /* 1 sn bekleme */
+  if (chip_id == 0x60) bme_write(0xF2, 0x01);
+  bme_write(0xF5, 0x60);                       /* 250 ms bekleme */
   bme_write(0xF4, 0x27);
+  HAL_Delay(300);
+
+  /* Baslangic sicakligi: 8 olcumun ortalamasi (yaklasik 2 sn) */
+  {
+    int32_t sum = 0, t;
+    uint32_t p, h;
+    int count = 0;
+    for (int i = 0; i < 8; i++)
+    {
+      HAL_Delay(250);
+      if (bme_measure(&t, &p, &h)) { sum += t; count++; }
+    }
+    if (count > 0) base_temp = sum / count;
+    snprintf(msg, sizeof(msg), "Baslangic sicakligi: %ld.%02ld C\r\n",
+             (long)(base_temp / 100), (long)abs(base_temp % 100));
+    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
+  }
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+    GPIO_InitTypeDef gpio = {0};
+    gpio.Pin = GPIO_PIN_13;
+    gpio.Mode = GPIO_MODE_INPUT;
+    gpio.Pull = GPIO_NOPULL;   /* kartta harici pull-up var */
+    HAL_GPIO_Init(GPIOC, &gpio);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -202,32 +246,41 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  uint8_t d[8];
-	      if (bme_read(0xF7, d, 8) == HAL_OK)
-	      {
-	        int32_t adc_P = ((int32_t)d[0] << 12) | ((int32_t)d[1] << 4) | (d[2] >> 4);
-	        int32_t adc_T = ((int32_t)d[3] << 12) | ((int32_t)d[4] << 4) | (d[5] >> 4);
-	        int32_t adc_H = ((int32_t)d[6] << 8) | d[7];
+	  int32_t t;
+	  uint32_t p, h;
+	  if (bme_measure(&t, &p, &h))
+	  {
+	    /* Mavi buton: yeni baslangic sicakligi */
+		if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_RESET)
+	    {
+	      base_temp = t;
+	      if (alarm_on) { alarm_on = 0; HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2); }
+	    }
 
-	        int32_t  t = comp_temp(adc_T);          /* once sicaklik: t_fine buradan gelir */
-	        uint32_t p = comp_press(adc_P) / 256;   /* Pa */
-	        uint32_t h = comp_hum(adc_H) / 1024;    /* %RH */
+	    int32_t diff = t - base_temp;
 
-	        if (chip_id == 0x60)
-	          snprintf(msg, sizeof(msg), "T: %ld.%02ld C | P: %lu.%02lu hPa | H: %lu %%\r\n",
-	                   (long)(t / 100), (long)abs(t % 100),
-	                   (unsigned long)(p / 100), (unsigned long)(p % 100), (unsigned long)h);
-	        else
-	          snprintf(msg, sizeof(msg), "T: %ld.%02ld C | P: %lu.%02lu hPa\r\n",
-	                   (long)(t / 100), (long)abs(t % 100),
-	                   (unsigned long)(p / 100), (unsigned long)(p % 100));
+	    if (!alarm_on && abs(diff) >= ALARM_DELTA)
+	    {
+	      alarm_on = 1;
+	      HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+	    }
+	    else if (alarm_on && abs(diff) <= ALARM_OFF)
+	    {
+	      alarm_on = 0;
+	      HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
+	    }
 
-	        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
-	      }
-	      HAL_Delay(1000);
+	    snprintf(msg, sizeof(msg), "T: %ld.%02ld C | Fark: %c%ld.%02ld C | %s\r\n",
+	             (long)(t / 100), (long)abs(t % 100),
+	             diff < 0 ? '-' : '+', (long)(abs(diff) / 100), (long)(abs(diff) % 100),
+	             alarm_on ? "ALARM" : "normal");
+	    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
+	  }
+	  HAL_Delay(250);
   }
   /* USER CODE END 3 */
 }
+
 
 /**
   * @brief System Clock Configuration
@@ -301,6 +354,65 @@ static void MX_I2C1_Init(void)
   /* USER CODE BEGIN I2C1_Init 2 */
 
   /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 15;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 499;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 250;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+  HAL_TIM_MspPostInit(&htim2);
 
 }
 
