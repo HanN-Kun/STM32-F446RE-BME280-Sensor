@@ -1,0 +1,10 @@
+# Derleme (Build) çıktıları
+Debug/
+Release/
+build/
+
+# Kullanıcıya özel hata ayıklama yapılandırmaları
+*.launch
+
+# İsteğe bağlı: IDE'ye özgü kullanıcı ayarları (genellikle göz ardı edilir)
+.settings/
